@@ -14,6 +14,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	"os"
 	"path/filepath"
+	"regexp"
 )
 
 func main() {
@@ -95,9 +96,13 @@ type inliner struct {
 }
 
 func (i *inliner) InlineBundles(ctx context.Context) error {
-	nonChannelHeads, err := i.getAllNonChannelHeads()
-	if err != nil {
-		return fmt.Errorf("get non-channel-head bundles: %v", err)
+	nonChannelHeads := map[string]struct{}{}
+	if i.deleteNonHeadObjects {
+		var err error
+		nonChannelHeads, err = i.getAllNonChannelHeads()
+		if err != nil {
+			return fmt.Errorf("get non-channel-head bundles: %v", err)
+		}
 	}
 
 	for _, bi := range i.bundleImages {
@@ -139,11 +144,16 @@ func (i *inliner) InlineBundles(ctx context.Context) error {
 	return nil
 }
 
+var nonRetryableRegex = regexp.MustCompile(`(error resolving name)`)
+
 func (i inliner) PopulateBundleObjects(ctx context.Context, b *declcfg.Bundle, ref image.Reference) error {
 	log.Infof("Pulling bundle image %q", ref)
 	if err := retry.OnError(retry.DefaultRetry,
 		func(err error) bool {
-			log.Warnf("    Error pulling image: %v. Retrying.", err)
+			if nonRetryableRegex.MatchString(err.Error()) {
+				return false
+			}
+			log.Warnf("  Error pulling image: %v. Retrying.", err)
 			return true
 		},
 		func() error { return i.imageRegistry.Pull(ctx, ref)}); err != nil {
