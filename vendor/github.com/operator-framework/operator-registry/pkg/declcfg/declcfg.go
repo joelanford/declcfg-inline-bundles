@@ -40,12 +40,11 @@ type Bundle struct {
 
 	// These fields are present so that we can continue serving
 	// the GRPC API the way packageserver expects us to in a
-	// backwards-compatible way. These are populated by a separate
-	// "objects" directory in the configs directory/tar.
+	// backwards-compatible way. These are populated from
+	// any `olm.bundle.object` properties.
 	//
-	// These fields should never be persisted in the bundle blob.
-	// Instead they will be written to a separate directory in
-	// the configs dir: "objects/<pkgName>/<bundleName>/"
+	// These fields will never be persisted in the bundle blob as
+	// first class fields.
 	CsvJSON string   `json:"-"`
 	Objects []string `json:"-"`
 }

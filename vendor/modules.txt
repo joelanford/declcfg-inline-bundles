@@ -146,6 +146,11 @@ github.com/h2non/filetype/matchers/isobmff
 github.com/h2non/filetype/types
 # github.com/h2non/go-is-svg v0.0.0-20160927212452-35e8c4b0612c
 github.com/h2non/go-is-svg
+# github.com/hashicorp/errwrap v1.0.0
+github.com/hashicorp/errwrap
+# github.com/hashicorp/go-multierror v1.0.0
+## explicit
+github.com/hashicorp/go-multierror
 # github.com/inconshreveable/mousetrap v1.0.0
 github.com/inconshreveable/mousetrap
 # github.com/json-iterator/go v1.1.10

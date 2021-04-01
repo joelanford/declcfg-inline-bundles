@@ -19,22 +19,12 @@ func LoadDir(configDir string) (*DeclarativeConfig, error) {
 	return loadFS(configDir, w)
 }
 
-func loadFile(configFile string) (*DeclarativeConfig, error) {
-	f, err := os.Open(configFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %v", err)
-	}
-	defer f.Close()
-	return readJSON(f)
-}
-
 func loadFS(root string, w fsWalker) (*DeclarativeConfig, error) {
 	cfg := &DeclarativeConfig{}
 	if err := w.WalkFiles(root, func(path string, r io.Reader) error {
 		fileCfg, err := readJSON(r)
 		if err != nil {
-			// Ignore errors for unreconized files.
-			return nil
+			return fmt.Errorf("could not load config file %q: %v", path, err)
 		}
 		if err := readBundleObjects(fileCfg.Bundles, root, path); err != nil {
 			return fmt.Errorf("read bundle objects: %v", err)
@@ -87,12 +77,13 @@ func readJSON(r io.Reader) (*DeclarativeConfig, error) {
 	for dec.More() {
 		doc := &json.RawMessage{}
 		if err := dec.Decode(doc); err != nil {
-			return nil, fmt.Errorf("parse error at offset %d: %v", dec.InputOffset(), err)
+			return cfg, nil
 		}
 
 		var in Meta
 		if err := json.Unmarshal(*doc, &in); err != nil {
-			return nil, fmt.Errorf("parse meta object at offset %d: %v", dec.InputOffset(), err)
+			// Ignore JSON blobs if they are not parsable as meta objects.
+			continue
 		}
 
 		switch in.Schema {
@@ -109,6 +100,7 @@ func readJSON(r io.Reader) (*DeclarativeConfig, error) {
 			}
 			cfg.Bundles = append(cfg.Bundles, b)
 		case "":
+			// Ignore meta blobs that don't have a schema.
 			continue
 		default:
 			cfg.Others = append(cfg.Others, in)

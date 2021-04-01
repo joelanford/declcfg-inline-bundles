@@ -3,18 +3,21 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/fs"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sync"
+
+	"github.com/hashicorp/go-multierror"
 	"github.com/operator-framework/operator-registry/pkg/declcfg"
 	"github.com/operator-framework/operator-registry/pkg/image"
 	"github.com/operator-framework/operator-registry/pkg/image/containerdregistry"
 	"github.com/operator-framework/operator-registry/pkg/property"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"io/fs"
-	"io/ioutil"
 	"k8s.io/client-go/util/retry"
-	"os"
-	"path/filepath"
-	"regexp"
 )
 
 func main() {
@@ -27,7 +30,7 @@ func main() {
 func newCmd() *cobra.Command {
 	i := inliner{}
 	cmd := &cobra.Command{
-		Use: "declcfg-inline-bundles <configsDir> <bundleImage1> <bundleImage2> ... <bundleImageN>",
+		Use:  "declcfg-inline-bundles <configsDir> <bundleImage1> <bundleImage2> ... <bundleImageN>",
 		Args: cobra.MinimumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			configsDir := args[0]
@@ -44,6 +47,7 @@ func newCmd() *cobra.Command {
 			}()
 			i.imageRegistry = reg
 
+			log.Info("Loading declarative configuration directory")
 			i.cfg, err = declcfg.LoadDir(configsDir)
 			if err != nil {
 				log.Fatalf("Error loading declarative configuration directory: %v", err)
@@ -88,8 +92,8 @@ func noopLogger() *log.Entry {
 }
 
 type inliner struct {
-	cfg *declcfg.DeclarativeConfig
-	bundleImages []string
+	cfg                  *declcfg.DeclarativeConfig
+	bundleImages         []string
 	deleteNonHeadObjects bool
 
 	imageRegistry image.Registry
@@ -104,7 +108,21 @@ func (i *inliner) InlineBundles(ctx context.Context) error {
 			return fmt.Errorf("get non-channel-head bundles: %v", err)
 		}
 	}
+	errs := make(chan error)
 
+	var (
+		result *multierror.Error
+		eg     sync.WaitGroup
+	)
+	eg.Add(1)
+	go func() {
+		for err := range errs {
+			result = multierror.Append(result, err)
+		}
+		eg.Done()
+	}()
+
+	var wg sync.WaitGroup
 	for _, bi := range i.bundleImages {
 		var declBundle *declcfg.Bundle
 		for idx := range i.cfg.Bundles {
@@ -114,8 +132,7 @@ func (i *inliner) InlineBundles(ctx context.Context) error {
 			}
 		}
 		if declBundle == nil {
-			log.Warnf("Skipping bundle image %q: not found in index", bi)
-			continue
+			return fmt.Errorf("bundle image %q not found in index", bi)
 		}
 
 		if _, ok := nonChannelHeads[declBundle.Image]; ok && i.deleteNonHeadObjects {
@@ -123,10 +140,21 @@ func (i *inliner) InlineBundles(ctx context.Context) error {
 			continue
 		}
 
-		ref := image.SimpleReference(bi)
-		if err := i.PopulateBundleObjects(ctx, declBundle, ref); err != nil {
-			return fmt.Errorf("populate objects for bundle %q: %v", declBundle.Name, err)
-		}
+		wg.Add(1)
+		go func(bi string) {
+			ref := image.SimpleReference(bi)
+			if err := i.PopulateBundleObjects(ctx, declBundle, ref); err != nil {
+				errs <- fmt.Errorf("populate objects for bundle %q: %v", declBundle.Name, err)
+			}
+			wg.Done()
+		}(bi)
+	}
+	wg.Wait()
+	close(errs)
+	eg.Wait()
+
+	if result != nil {
+		return result
 	}
 
 	if i.deleteNonHeadObjects {
@@ -156,18 +184,18 @@ func (i inliner) PopulateBundleObjects(ctx context.Context, b *declcfg.Bundle, r
 			log.Warnf("  Error pulling image: %v. Retrying.", err)
 			return true
 		},
-		func() error { return i.imageRegistry.Pull(ctx, ref)}); err != nil {
-		return  fmt.Errorf("pull image %q: %v", ref, err)
+		func() error { return i.imageRegistry.Pull(ctx, ref) }); err != nil {
+		return fmt.Errorf("pull image %q: %v", ref, err)
 	}
 
 	lbls, err := i.imageRegistry.Labels(ctx, ref)
 	if err != nil {
-		return  fmt.Errorf("get labels for bundle %q: %v", ref, err)
+		return fmt.Errorf("get labels for bundle %q: %v", ref, err)
 	}
 
 	tempDir, err := ioutil.TempDir("", ".tmp.declcfg-inline-bundles-")
 	if err != nil {
-		return  fmt.Errorf("create temp directory: %v", err)
+		return fmt.Errorf("create temp directory: %v", err)
 	}
 	defer func() {
 		if err := os.RemoveAll(tempDir); err != nil {
@@ -176,7 +204,7 @@ func (i inliner) PopulateBundleObjects(ctx context.Context, b *declcfg.Bundle, r
 	}()
 
 	if err := i.imageRegistry.Unpack(ctx, ref, tempDir); err != nil {
-		return  fmt.Errorf("unpacked bundle %q: %v", ref, err)
+		return fmt.Errorf("unpacked bundle %q: %v", ref, err)
 	}
 
 	manifestDir, ok := lbls["operators.operatorframework.io.bundle.manifests.v1"]
@@ -184,7 +212,6 @@ func (i inliner) PopulateBundleObjects(ctx context.Context, b *declcfg.Bundle, r
 		manifestDir = "manifests/"
 	}
 	manifestDir = filepath.Join(tempDir, manifestDir)
-
 
 	// Clear out existing bundle objects and object properties
 	deleteBundleObjects(b)

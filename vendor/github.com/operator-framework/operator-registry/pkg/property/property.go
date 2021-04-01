@@ -230,13 +230,6 @@ func Deduplicate(in []Property) []Property {
 	return out
 }
 
-func ValidateBackCompat(in Properties) error {
-	if len(in.Packages) != 1 {
-		return fmt.Errorf("property type %q is required", TypePackage)
-	}
-	return nil
-}
-
 func Build(p interface{}) (*Property, error) {
 	var (
 		typ string
