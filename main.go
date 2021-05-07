@@ -11,13 +11,14 @@ import (
 	"sync"
 
 	"github.com/hashicorp/go-multierror"
-	"github.com/operator-framework/operator-registry/pkg/declcfg"
 	"github.com/operator-framework/operator-registry/pkg/image"
 	"github.com/operator-framework/operator-registry/pkg/image/containerdregistry"
-	"github.com/operator-framework/operator-registry/pkg/property"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"k8s.io/client-go/util/retry"
+
+	"github.com/joelanford/declcfg-inline-bundles/internal/declcfg"
+	"github.com/joelanford/declcfg-inline-bundles/internal/property"
 )
 
 func main() {
@@ -108,6 +109,11 @@ func (i *inliner) InlineBundles(ctx context.Context) error {
 			return fmt.Errorf("get non-channel-head bundles: %v", err)
 		}
 	}
+
+	for img := range nonChannelHeads {
+		fmt.Println("inlining", img)
+	}
+
 	errs := make(chan error)
 
 	var (
