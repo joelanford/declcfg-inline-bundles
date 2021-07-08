@@ -1,25 +1,27 @@
 package main
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
-	"io/fs"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sync"
 
-	"github.com/hashicorp/go-multierror"
 	"github.com/operator-framework/operator-registry/pkg/image"
 	"github.com/operator-framework/operator-registry/pkg/image/containerdregistry"
+	"github.com/operator-framework/operator-registry/pkg/registry"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/retry"
 
 	"github.com/joelanford/declcfg-inline-bundles/internal/declcfg"
 	"github.com/joelanford/declcfg-inline-bundles/internal/property"
 )
+
+var nonRetryableRegex = regexp.MustCompile(`(error resolving name)`)
 
 func main() {
 	cmd := newCmd()
@@ -29,60 +31,151 @@ func main() {
 }
 
 func newCmd() *cobra.Command {
-	i := inliner{}
+	var pruneNonHeadObjects bool
 	cmd := &cobra.Command{
 		Use:  "declcfg-inline-bundles <configsDir> <bundleImage1> <bundleImage2> ... <bundleImageN>",
 		Args: cobra.MinimumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
-			configsDir := args[0]
-			i.bundleImages = args[1:]
+			rootDir := args[0]
+			root := os.DirFS(rootDir)
+			bundleImages := sets.NewString(args[1:]...)
 
-			reg, err := containerdregistry.NewRegistry(containerdregistry.WithLog(noopLogger()))
+			imageRegistry, err := containerdregistry.NewRegistry(containerdregistry.WithLog(noopLogger()))
 			if err != nil {
 				log.Fatalf("Could not create new containerd registry: %v")
 			}
 			defer func() {
-				if err := reg.Destroy(); err != nil {
+				if err := imageRegistry.Destroy(); err != nil {
 					log.Warnf("Could not destroy containerd registry: %v", err)
 				}
 			}()
-			i.imageRegistry = reg
+
+			eg := errgroup.Group{}
 
 			log.Info("Loading declarative configuration directory")
-			i.cfg, err = declcfg.LoadDir(configsDir)
+			cfg, err := declcfg.LoadFS(root)
 			if err != nil {
-				log.Fatalf("Error loading declarative configuration directory: %v", err)
+				log.Fatal(err)
 			}
 
-			if len(i.bundleImages) == 0 {
-				for _, b := range i.cfg.Bundles {
-					i.bundleImages = append(i.bundleImages, b.Image)
+			allBundleImages := sets.NewString()
+			for _, b := range cfg.Bundles {
+				allBundleImages.Insert(b.Image)
+			}
+			notPresentImages := bundleImages.Difference(allBundleImages)
+			if notPresentImages.Len() > 0 {
+				log.Fatalf("requested images not found: %v", notPresentImages.List())
+			}
+
+			nonChannelHeads := sets.NewString()
+			if pruneNonHeadObjects {
+				nonChannelHeads, err = getAllNonChannelHeads(*cfg)
+				if err != nil {
+					log.Fatal(err)
 				}
 			}
 
-			if err := i.InlineBundles(cmd.Context()); err != nil {
-				log.Fatalf("Error inlining bundles: %v", err)
-			}
-
-			configsDirBak := fmt.Sprintf("%s.bak", configsDir)
-			if err := os.Rename(configsDir, configsDirBak); err != nil {
-				log.Fatalf("Error backing up existing configs directory: %v", err)
-			}
-			if err := os.RemoveAll(configsDir); err != nil {
-				log.Fatalf("Error removing stale configs directory: %v", err)
-			}
-			if err := declcfg.WriteDir(*i.cfg, configsDir); err != nil {
-				if err := os.Rename(configsDirBak, configsDir); err != nil {
-					log.Fatalf("Error restoring configs directory backup from %q: %v", configsDirBak, err)
+			declcfg.WalkFS(root, func(path string, fcfg *declcfg.DeclarativeConfig, err error) error {
+				if err != nil {
+					return err
 				}
-				log.Fatalf("Error writing new configs directory: %v", err)
-			}
-			if err := os.RemoveAll(configsDirBak); err != nil {
-				log.Fatalf("Error removing backup configs directory: %v", err)
+				plog := log.New().WithField("path", filepath.Join(rootDir, path))
+				eg.Go(func() error {
+					for i, b := range fcfg.Bundles {
+						blog := plog.WithField("image", b.Image)
+						// prune bundle objects from all non-channel heads, if pruning is enabled
+						if pruneNonHeadObjects && nonChannelHeads.Has(b.Image) {
+							props := b.Properties[:0]
+							for _, p := range b.Properties {
+								if p.Type != property.TypeBundleObject {
+									props = append(props, p)
+								}
+							}
+							if len(props) != len(fcfg.Bundles[i].Properties) {
+								blog.Info("pruned olm.bundle.object properties")
+							}
+							fcfg.Bundles[i].Properties = props
+						}
+						if pruneNonHeadObjects && nonChannelHeads.Has(b.Image) {
+							blog.Info("skipping non-channel head")
+						} else if bundleImages.Len() == 0 || bundleImages.Has(b.Image) {
+							imgRef := image.SimpleReference(b.Image)
+
+							if err := retry.OnError(retry.DefaultRetry,
+								func(err error) bool {
+									if nonRetryableRegex.MatchString(err.Error()) {
+										return false
+									}
+									log.Warnf("  Error pulling image: %v. Retrying.", err)
+									return true
+								},
+								func() error { return imageRegistry.Pull(cmd.Context(), imgRef) }); err != nil {
+								return fmt.Errorf("pull image %q: %v", imgRef, err)
+							}
+
+							tmpDir, err := os.MkdirTemp("", "declcfg-inline-bundles-")
+							if err != nil {
+								return err
+							}
+							if err := imageRegistry.Unpack(cmd.Context(), imgRef, tmpDir); err != nil {
+								return err
+							}
+							ii, err := registry.NewImageInput(image.SimpleReference(b.Image), tmpDir)
+							if err != nil {
+								return err
+							}
+							props := b.Properties[:0]
+							for _, p := range b.Properties {
+								if p.Type != property.TypeBundleObject {
+									props = append(props, p)
+								} else {
+									var obj property.BundleObject
+									if err := json.Unmarshal(p.Value, &obj); err != nil {
+										return err
+									}
+									// Delete the referenced file if the object property is a reference.
+									if obj.IsRef() {
+										os.RemoveAll(filepath.Join(rootDir, filepath.Dir(path), obj.GetRef()))
+									}
+								}
+							}
+
+							for _, obj := range ii.Bundle.Objects {
+								objJson, err := json.Marshal(obj)
+								if err != nil {
+									return err
+								}
+								props = append(props, property.MustBuildBundleObjectData(objJson))
+							}
+							b.Properties = props
+							fcfg.Bundles[i] = b
+							blog.Info("inlined olm.bundle.object properties")
+						}
+					}
+					f, err := os.OpenFile(filepath.Join(rootDir, path), os.O_RDWR|os.O_TRUNC, 0666)
+					if err != nil {
+						return err
+					}
+					if filepath.Ext(path) == ".yaml" {
+						if err := declcfg.WriteYAML(*fcfg, f); err != nil {
+							return err
+						}
+					} else {
+						if err := declcfg.WriteJSON(*fcfg, f); err != nil {
+							return err
+						}
+					}
+					return nil
+				})
+				return nil
+			})
+
+			if err := eg.Wait(); err != nil {
+				log.Fatal(err)
 			}
 		},
 	}
-	cmd.Flags().BoolVar(&i.deleteNonHeadObjects, "delete-non-head-objects", false, "Delete objects for bundles that are not channel heads.")
+	cmd.Flags().BoolVarP(&pruneNonHeadObjects, "prune-non-head-objects", "p", false, "Prune objects for bundles that are not channel heads.")
 	return cmd
 }
 
@@ -92,198 +185,28 @@ func noopLogger() *log.Entry {
 	return log.NewEntry(l)
 }
 
-type inliner struct {
-	cfg                  *declcfg.DeclarativeConfig
-	bundleImages         []string
-	deleteNonHeadObjects bool
-
-	imageRegistry image.Registry
-}
-
-func (i *inliner) InlineBundles(ctx context.Context) error {
-	nonChannelHeads := map[string]struct{}{}
-	if i.deleteNonHeadObjects {
-		var err error
-		nonChannelHeads, err = i.getAllNonChannelHeads()
-		if err != nil {
-			return fmt.Errorf("get non-channel-head bundles: %v", err)
-		}
-	}
-
-	for img := range nonChannelHeads {
-		fmt.Println("inlining", img)
-	}
-
-	errs := make(chan error)
-
-	var (
-		result *multierror.Error
-		eg     sync.WaitGroup
-	)
-	eg.Add(1)
-	go func() {
-		for err := range errs {
-			result = multierror.Append(result, err)
-		}
-		eg.Done()
-	}()
-
-	var wg sync.WaitGroup
-	for _, bi := range i.bundleImages {
-		var declBundle *declcfg.Bundle
-		for idx := range i.cfg.Bundles {
-			if i.cfg.Bundles[idx].Image == bi {
-				declBundle = &i.cfg.Bundles[idx]
-				break
-			}
-		}
-		if declBundle == nil {
-			return fmt.Errorf("bundle image %q not found in index", bi)
-		}
-
-		if _, ok := nonChannelHeads[declBundle.Image]; ok && i.deleteNonHeadObjects {
-			log.Warnf("Skipping bundle image %q: not a channel head", bi)
-			continue
-		}
-
-		wg.Add(1)
-		go func(bi string) {
-			ref := image.SimpleReference(bi)
-			if err := i.PopulateBundleObjects(ctx, declBundle, ref); err != nil {
-				errs <- fmt.Errorf("populate objects for bundle %q: %v", declBundle.Name, err)
-			}
-			wg.Done()
-		}(bi)
-	}
-	wg.Wait()
-	close(errs)
-	eg.Wait()
-
-	if result != nil {
-		return result
-	}
-
-	if i.deleteNonHeadObjects {
-		for idx := range i.cfg.Bundles {
-			b := &i.cfg.Bundles[idx]
-			if _, ok := nonChannelHeads[b.Image]; !ok {
-				continue
-			}
-			if deleteBundleObjects(b) {
-				log.Infof("Deleted objects for non-channel-head bundle %q", b.Name)
-			}
-		}
-	}
-
-	return nil
-}
-
-var nonRetryableRegex = regexp.MustCompile(`(error resolving name)`)
-
-func (i inliner) PopulateBundleObjects(ctx context.Context, b *declcfg.Bundle, ref image.Reference) error {
-	log.Infof("Pulling bundle image %q", ref)
-	if err := retry.OnError(retry.DefaultRetry,
-		func(err error) bool {
-			if nonRetryableRegex.MatchString(err.Error()) {
-				return false
-			}
-			log.Warnf("  Error pulling image: %v. Retrying.", err)
-			return true
-		},
-		func() error { return i.imageRegistry.Pull(ctx, ref) }); err != nil {
-		return fmt.Errorf("pull image %q: %v", ref, err)
-	}
-
-	lbls, err := i.imageRegistry.Labels(ctx, ref)
-	if err != nil {
-		return fmt.Errorf("get labels for bundle %q: %v", ref, err)
-	}
-
-	tempDir, err := ioutil.TempDir("", ".tmp.declcfg-inline-bundles-")
-	if err != nil {
-		return fmt.Errorf("create temp directory: %v", err)
-	}
-	defer func() {
-		if err := os.RemoveAll(tempDir); err != nil {
-			log.Warnf("delete temp directory %q: %v", tempDir, err)
-		}
-	}()
-
-	if err := i.imageRegistry.Unpack(ctx, ref, tempDir); err != nil {
-		return fmt.Errorf("unpacked bundle %q: %v", ref, err)
-	}
-
-	manifestDir, ok := lbls["operators.operatorframework.io.bundle.manifests.v1"]
-	if !ok {
-		manifestDir = "manifests/"
-	}
-	manifestDir = filepath.Join(tempDir, manifestDir)
-
-	// Clear out existing bundle objects and object properties
-	deleteBundleObjects(b)
-
-	if err := filepath.WalkDir(manifestDir, func(path string, info fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			return nil
-		}
-		obj, err := ioutil.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("read file %q: %v", path, err)
-		}
-		ref := filepath.Join("objects", b.Name, info.Name())
-		b.Properties = append(b.Properties, property.MustBuildBundleObjectRef(ref))
-		b.Objects = append(b.Objects, string(obj))
-		return nil
-	}); err != nil {
-		return fmt.Errorf("collect objects for bundle %q: %v", ref, err)
-	}
-	return nil
-}
-
-func (i inliner) getAllNonChannelHeads() (map[string]struct{}, error) {
-	m, err := declcfg.ConvertToModel(*i.cfg)
+func getAllNonChannelHeads(cfg declcfg.DeclarativeConfig) (sets.String, error) {
+	m, err := declcfg.ConvertToModel(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("convert index to model: %v", err)
 	}
 
-	nonChannelHeads := map[string]struct{}{}
+	nonChannelHeads := sets.NewString()
 	for _, pkg := range m {
 		for _, ch := range pkg.Channels {
 			for _, b := range ch.Bundles {
-				nonChannelHeads[b.Image] = struct{}{}
+				nonChannelHeads.Insert(b.Image)
 			}
 		}
 	}
 	for _, pkg := range m {
 		for _, ch := range pkg.Channels {
-			head, _ := ch.Head()
-			delete(nonChannelHeads, head.Image)
+			head, err := ch.Head()
+			if err != nil {
+				return nil, err
+			}
+			nonChannelHeads.Delete(head.Image)
 		}
 	}
-
 	return nonChannelHeads, nil
-}
-
-func deleteBundleObjects(b *declcfg.Bundle) bool {
-	deleted := false
-
-	b.CsvJSON = ""
-	if len(b.Objects) > 0 {
-		b.Objects = nil
-		deleted = true
-	}
-
-	temp := b.Properties[:0]
-	for _, p := range b.Properties {
-		if p.Type == property.TypeBundleObject {
-			deleted = true
-		} else {
-			temp = append(temp, p)
-		}
-	}
-	b.Properties = temp
-	return deleted
 }
