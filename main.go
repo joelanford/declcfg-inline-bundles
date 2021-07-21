@@ -17,8 +17,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/retry"
 
-	"github.com/joelanford/declcfg-inline-bundles/internal/declcfg"
-	"github.com/joelanford/declcfg-inline-bundles/internal/property"
+	"github.com/operator-framework/operator-registry/alpha/declcfg"
+	"github.com/operator-framework/operator-registry/alpha/property"
 )
 
 var nonRetryableRegex = regexp.MustCompile(`(error resolving name)`)

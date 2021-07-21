@@ -7,7 +7,6 @@ require (
 	github.com/bshuster-repo/logrus-logstash-hook v1.0.0 // indirect
 	github.com/h2non/filetype v1.1.1
 	github.com/h2non/go-is-svg v0.0.0-20160927212452-35e8c4b0612c
-	github.com/hashicorp/go-multierror v1.0.0
 	github.com/joelanford/ignore v0.0.0-20210610194209-63d4919d8fb2
 	github.com/operator-framework/api v0.7.1
 	github.com/operator-framework/operator-registry v1.17.4
@@ -20,3 +19,5 @@ require (
 	rsc.io/letsencrypt v0.0.3 // indirect
 	sigs.k8s.io/yaml v1.2.0
 )
+
+replace github.com/operator-framework/operator-registry => github.com/joelanford/operator-registry v1.12.2-0.20210721025046-a8d185d7a62c
